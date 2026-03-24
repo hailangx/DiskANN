@@ -266,6 +266,28 @@ impl Callbacks {
         result
     }
 
+    pub fn read_varsize_eid(&self, ctx: Context, id: &GarnetId) -> Option<Vec<u8>> {
+        let mut result = None;
+        let mut cb = |_, data: &[u8]| {
+            result = Some(data.to_owned());
+        };
+
+        // SAFETY: GarnetId ensures there are 4 bytes preceding the key bytes.
+        unsafe {
+            let key = id.as_prefixed_key_bytes();
+            (self.read_callback)(
+                ctx.0,
+                1,
+                key.as_ptr(),
+                key.len(),
+                make_read_call(&cb),
+                &mut cb as *mut _ as *mut c_void,
+            );
+        }
+
+        result
+    }
+
     #[must_use]
     pub fn write_iid<D: bytemuck::Pod>(&self, ctx: Context, id: u32, value: &[D]) -> bool {
         let key = [0, id];

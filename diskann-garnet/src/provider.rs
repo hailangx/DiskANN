@@ -6,12 +6,13 @@
 use dashmap::DashMap;
 use diskann::{
     ANNError, ANNErrorKind, ANNResult,
+    error::StandardError,
     graph::{
         AdjacencyList, SearchOutputBuffer,
         config::defaults::MAX_OCCLUSION_SIZE,
         glue::{
             self, ExpandBeam, FillSet, InplaceDeleteStrategy, InsertStrategy, PruneStrategy,
-            SearchExt, SearchPostProcess, SearchStrategy,
+            SearchExt, SearchPostProcess, SearchPostProcessStep, SearchStrategy,
         },
     },
     neighbor::Neighbor,
@@ -34,6 +35,7 @@ use std::{
 use thiserror::Error;
 
 use crate::{
+    FilterCandidateCallback,
     fsm::{FreeSpaceMap, FsmError},
     garnet::{Callbacks, Context, GarnetError, GarnetId, Term},
 };
@@ -226,6 +228,15 @@ impl<T: VectorRepr> GarnetProvider<T> {
             Err(GarnetError::Write.into())
         }
     }
+
+    pub fn get_attributes(
+        &self,
+        context: &Context,
+        id: &GarnetId,
+    ) -> Option<Vec<u8>> {
+        self.callbacks
+            .read_varsize_eid(context.term(Term::Attributes), id)
+    }
     pub fn vector_id_exists(&self, context: &Context, id: &GarnetId) -> bool {
         let iid = match self.to_internal_id(context, id) {
             Ok(iid) => iid,
@@ -389,8 +400,8 @@ impl<T: VectorRepr> Delete for GarnetProvider<T> {
 
 #[allow(dead_code)]
 pub struct FullAccessor<'a, T: VectorRepr> {
-    provider: &'a GarnetProvider<T>,
-    context: &'a Context,
+    pub(crate) provider: &'a GarnetProvider<T>,
+    pub(crate) context: &'a Context,
     is_search: bool,
     id_buffer: PooledRef<'a, AdjList>,
     filtered_ids: PooledRef<'a, Vec<u32>>,
@@ -776,6 +787,116 @@ impl<'a, T: VectorRepr> SearchPostProcess<FullAccessor<'a, T>, [T], GarnetId> fo
         }
         let count = output.current_len() - initial;
         future::ready(Ok(count))
+    }
+}
+
+/// Inplace post-processing step that calls a C# callback per-candidate for filter evaluation.
+/// Candidates where the callback returns 0 are dropped from the iterator.
+///
+/// Stopping conditions:
+/// - `max_effort`: max total candidates to evaluate (pass or fail). Once exhausted, stop iterating.
+/// - The downstream `CopyExternalIds` signals `BufferState::Full` when the output buffer
+///   (sized to `retrieve_count`) is full, stopping the pipeline.
+#[derive(Clone, Copy)]
+pub struct InplacePostFilter {
+    pub context_raw: u64,
+    pub callback: FilterCandidateCallback,
+    pub max_effort: usize,
+}
+
+unsafe impl Send for InplacePostFilter {}
+unsafe impl Sync for InplacePostFilter {}
+
+impl<A, T, O> SearchPostProcessStep<A, T, O> for InplacePostFilter
+where
+    A: BuildQueryComputer<T, Id = u32> + SearchExt,
+    T: Send + Sync + ?Sized,
+{
+    type Error<NextError>
+        = ANNError
+    where
+        NextError: StandardError;
+
+    type NextAccessor = A;
+
+    async fn post_process_step<I, B, Next>(
+        &self,
+        next: &Next,
+        accessor: &mut A,
+        query: &T,
+        computer: &A::QueryComputer,
+        candidates: I,
+        output: &mut B,
+    ) -> ANNResult<usize>
+    where
+        I: Iterator<Item = Neighbor<A::Id>> + Send,
+        B: SearchOutputBuffer<O> + Send + ?Sized,
+        Next: SearchPostProcess<A, T, O> + Sync,
+    {
+        let cb = self.callback;
+        let ctx = self.context_raw;
+        let max_effort = self.max_effort;
+
+        let filtered = candidates
+            .scan(0usize, move |evaluated, n| {
+                if *evaluated >= max_effort {
+                    return None; // budget exhausted — terminate iterator
+                }
+                *evaluated += 1;
+                if unsafe { cb(ctx, n.id) != 0 } {
+                    Some(Some(n)) // passes filter
+                } else {
+                    Some(None) // didn't pass, keep iterating
+                }
+            })
+            .flatten();
+
+        next.post_process(accessor, query, computer, filtered, output)
+            .await
+            .map_err(|err| {
+                let err: ANNError = err.into();
+                err.context("after inplace post-processing filter")
+            })
+    }
+}
+
+/// Search strategy that applies an inplace post-processing filter callback.
+/// Pipeline: FilterStartPoints → InplacePostFilter → CopyExternalIds
+pub struct InplacePostFilterPrecision {
+    pub context_raw: u64,
+    pub callback: FilterCandidateCallback,
+    pub max_effort: usize,
+}
+
+unsafe impl Send for InplacePostFilterPrecision {}
+unsafe impl Sync for InplacePostFilterPrecision {}
+
+impl<T: VectorRepr> SearchStrategy<GarnetProvider<T>, [T], GarnetId> for InplacePostFilterPrecision {
+    type SearchAccessor<'a> = FullAccessor<'a, T>;
+    type SearchAccessorError = GarnetProviderError;
+    type QueryComputer = T::QueryDistance;
+    type PostProcessor = glue::Pipeline<glue::FilterStartPoints, glue::Pipeline<InplacePostFilter, CopyExternalIds>>;
+
+    fn search_accessor<'a>(
+        &'a self,
+        provider: &'a GarnetProvider<T>,
+        context: &'a <GarnetProvider<T> as DataProvider>::Context,
+    ) -> Result<Self::SearchAccessor<'a>, Self::SearchAccessorError> {
+        Ok(FullAccessor::new(provider, context, true))
+    }
+
+    fn post_processor(&self) -> Self::PostProcessor {
+        glue::Pipeline::new(
+            glue::FilterStartPoints,
+            glue::Pipeline::new(
+                InplacePostFilter {
+                    context_raw: self.context_raw,
+                    callback: self.callback,
+                    max_effort: self.max_effort,
+                },
+                CopyExternalIds,
+            ),
+        )
     }
 }
 

@@ -102,6 +102,12 @@ struct SearchResults<'a> {
     id_index: usize,
 }
 
+/// Per-candidate filter callback: Rust → C#.
+/// Returns 1 if candidate passes, 0 otherwise.
+/// C# maintains the filter state in thread-local storage, so no state pointer is needed.
+pub type FilterCandidateCallback =
+    unsafe extern "C" fn(context: u64, internal_id: u32) -> u8;
+
 impl SearchResults<'_> {
     fn new(ids: *mut u8, ids_len: usize, dists: *mut f32, dists_len: usize) -> Self {
         let ids = unsafe { slice::from_raw_parts_mut(ids, ids_len) };
@@ -390,6 +396,9 @@ pub unsafe extern "C" fn insert(
     attribute_data: *const u8,
     attribute_len: usize,
 ) -> bool {
+    if index_ptr.is_null() {
+        return false;
+    }
     let index = unsafe { &*index_ptr.cast::<Index>() };
     let ctx = Context(ctx);
 
@@ -496,6 +505,36 @@ pub unsafe extern "C" fn set_attribute(
     }
 
     true
+}
+
+/// # Safety
+///
+/// FFI
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn get_attributes(
+    context: u64,
+    index_ptr: *const c_void,
+    id_data: *const u8,
+    id_len: usize,
+    output_data: *mut u8,
+    output_len: usize,
+) -> i32 {
+    let index = unsafe { &*index_ptr.cast::<Index>() };
+    let ctx = Context(context);
+    let id_bytes = unsafe { slice::from_raw_parts(id_data, id_len) };
+    let id = GarnetId::from(id_bytes);
+
+    match index.inner.get_attributes(&ctx, &id) {
+        Some(data) => {
+            if data.len() > output_len {
+                return -1;
+            }
+            let out = unsafe { slice::from_raw_parts_mut(output_data, data.len()) };
+            out.copy_from_slice(&data);
+            data.len() as i32
+        }
+        None => -1,
+    }
 }
 
 /// # Safety
@@ -626,6 +665,160 @@ pub unsafe extern "C" fn search_element(
     let res = index
         .inner
         .search_element(&ctx, &id, &params, filter, &mut output);
+    if let Ok(stats) = res {
+        if stats.result_count > i32::MAX as u32 {
+            -1
+        } else {
+            stats.result_count as i32
+        }
+    } else {
+        -1
+    }
+}
+
+/// # Safety
+///
+/// FFI — filtered vector search with inline callback.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn search_vector_filtered(
+    ctx: u64,
+    index_ptr: *const c_void,
+    vector_value_type: VectorValueType,
+    vector_data: *const u8,
+    vector_len: usize,
+    _delta: f32,
+    search_exploration_factor: u32,
+    bitmap_data: *const u8,
+    bitmap_len: usize,
+    max_filtering_effort: usize,
+    output_ids: *mut u8,
+    output_ids_len: usize,
+    output_distances: *mut f32,
+    output_distances_len: usize,
+    _continuation: *mut c_void,
+    filter_callback: FilterCandidateCallback,
+) -> i32 {
+    let index = unsafe { &*index_ptr.cast::<Index>() };
+
+    let v = if let Some(v) = interpret_vector(
+        index.quant_type,
+        vector_value_type,
+        &vector_data,
+        vector_len,
+    ) {
+        v
+    } else {
+        return -1;
+    };
+
+    let ctx = Context(ctx);
+
+    let mut output = SearchResults::new(
+        output_ids,
+        output_ids_len,
+        output_distances,
+        output_distances_len,
+    );
+
+    let params = match search::Knn::new(
+        output_distances_len,
+        search_exploration_factor as usize,
+        None,
+    ) {
+        Ok(params) => params,
+        Err(_) => return -1,
+    };
+
+    let has_filter = !bitmap_data.is_null() && bitmap_len > 0;
+
+    let labels = if has_filter {
+        Some(unsafe { labels::GarnetQueryLabelProvider::from_raw(bitmap_data, bitmap_len) })
+    } else {
+        None
+    };
+    let filter = labels.as_ref().map(|l| (l, FILTER_BETA));
+
+    let res = index.inner.search_vector_filtered(
+        &ctx,
+        &v,
+        &params,
+        filter,
+        filter_callback,
+        max_filtering_effort,
+        &mut output,
+    );
+
+    if let Ok(stats) = res {
+        if stats.result_count > i32::MAX as u32 {
+            -1
+        } else {
+            stats.result_count as i32
+        }
+    } else {
+        -1
+    }
+}
+
+/// # Safety
+///
+/// FFI — filtered element search with inline callback.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn search_element_filtered(
+    ctx: u64,
+    index_ptr: *const c_void,
+    id_data: *const u8,
+    id_len: usize,
+    _delta: f32,
+    search_exploration_factor: u32,
+    bitmap_data: *const u8,
+    bitmap_len: usize,
+    max_filtering_effort: usize,
+    output_ids: *mut u8,
+    output_ids_len: usize,
+    output_distances: *mut f32,
+    output_distances_len: usize,
+    _continuation: *mut c_void,
+    filter_callback: FilterCandidateCallback,
+) -> i32 {
+    let index = unsafe { &*index_ptr.cast::<Index>() };
+    let id_bytes = unsafe { slice::from_raw_parts(id_data, id_len) };
+    let id = GarnetId::from(id_bytes);
+    let ctx = Context(ctx);
+
+    let mut output = SearchResults::new(
+        output_ids,
+        output_ids_len,
+        output_distances,
+        output_distances_len,
+    );
+
+    let params = match search::Knn::new(
+        output_distances_len,
+        search_exploration_factor as usize,
+        None,
+    ) {
+        Ok(params) => params,
+        Err(_) => return -1,
+    };
+
+    let has_filter = !bitmap_data.is_null() && bitmap_len > 0;
+    let labels = if has_filter {
+        Some(unsafe { labels::GarnetQueryLabelProvider::from_raw(bitmap_data, bitmap_len) })
+    } else {
+        None
+    };
+    let filter = labels.as_ref().map(|l| (l, FILTER_BETA));
+
+    let res = index.inner.search_element_filtered(
+        &ctx,
+        &id,
+        &params,
+        filter,
+        filter_callback,
+        max_filtering_effort,
+        &mut output,
+    );
+
     if let Ok(stats) = res {
         if stats.result_count > i32::MAX as u32 {
             -1
