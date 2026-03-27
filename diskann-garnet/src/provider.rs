@@ -41,7 +41,7 @@ use crate::{
 };
 
 #[derive(Clone)]
-struct AdjList(AdjacencyList<u32>);
+pub(crate) struct AdjList(AdjacencyList<u32>);
 
 impl Deref for AdjList {
     type Target = AdjacencyList<u32>;
@@ -94,7 +94,7 @@ pub struct GarnetProvider<T: VectorRepr> {
     id_buffer_pool: ObjectPool<AdjList>,
     filtered_ids_pool: ObjectPool<Vec<u32>>,
     neighbor_cache: DashMap<u32, Vec<u32>, foldhash::fast::RandomState>,
-    start_point_cache: DashMap<u32, Vec<T>, foldhash::fast::RandomState>,
+    pub(crate) start_point_cache: DashMap<u32, Vec<T>, foldhash::fast::RandomState>,
     fsm: FreeSpaceMap,
 }
 
@@ -403,8 +403,8 @@ pub struct FullAccessor<'a, T: VectorRepr> {
     pub(crate) provider: &'a GarnetProvider<T>,
     pub(crate) context: &'a Context,
     is_search: bool,
-    id_buffer: PooledRef<'a, AdjList>,
-    filtered_ids: PooledRef<'a, Vec<u32>>,
+    pub(crate) id_buffer: PooledRef<'a, AdjList>,
+    pub(crate) filtered_ids: PooledRef<'a, Vec<u32>>,
 }
 
 impl<'a, T: VectorRepr> FullAccessor<'a, T> {
@@ -428,7 +428,7 @@ impl<'a, T: VectorRepr> FullAccessor<'a, T> {
         }
     }
 
-    fn get_neighbors_internal(&mut self, id: u32, dest: Option<&mut AdjacencyList<u32>>) -> bool {
+    pub(crate) fn get_neighbors_internal(&mut self, id: u32, dest: Option<&mut AdjacencyList<u32>>) -> bool {
         let dest = dest.unwrap_or(&mut self.id_buffer);
 
         let mut guard = dest.resize(self.provider.max_degree + 1);
