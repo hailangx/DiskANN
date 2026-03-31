@@ -3,20 +3,6 @@
  * Licensed under the MIT license.
  */
 
-//! Approach E: Unlimited-effort paged post-filter.
-//!
-//! Removes the max_effort cap from the paged filter loop. Instead of stopping
-//! after evaluating FILTER-EF candidates, the loop continues until either:
-//!   - k matching results are found, OR
-//!   - the graph returns 0 candidates (frontier exhausted)
-//!
-//! This mimics Redis's dual-queue approach where non-matching candidates don't
-//! consume the results budget. The graph explores outward from the query point,
-//! and the filter is applied purely as a post-processing step.
-//!
-//! Uses FullPrecision (no BetaFilter) — zero FFI callback overhead during
-//! graph traversal. The only FFI calls happen in the post-filter loop.
-
 use crate::{
     BatchFilterCandidateCallback,
     FilterCandidateCallback,
@@ -104,6 +90,9 @@ pub trait DynIndex: Send + Sync {
 }
 
 impl<T: VectorRepr> DynIndex for DiskANNIndex<GarnetProvider<T>> {
+    /// Inserts a type erased vector into the index.
+    ///
+    /// The data slice here must be aligned to `T` or this will panic.
     fn insert(&self, context: &Context, id: &GarnetId, data: &[u8]) -> ANNResult<()> {
         self.insert(
             FullPrecision,
@@ -165,16 +154,7 @@ impl<T: VectorRepr> DynIndex for DiskANNIndex<GarnetProvider<T>> {
         self.search_vector(context, data_bytes, params, filter, output)
     }
 
-    /// Filtered search dispatcher.
-    ///
-    /// Two modes selected via a high-bit flag in max_effort:
-    ///   - Normal (max_effort < PAGED_FLAG): two-queue filtered search with convergence
-    ///   - Paged (max_effort >= PAGED_FLAG): paged unlimited post-filter loop
-    ///
-    /// The paged mode uses DiskANN's native paged search (search_internal + next_search_results)
-    /// which explores the graph in beam-width pages and post-filters each page.
-    ///
-    /// To select paged mode from C#, set FILTER-EF to (desired_effort | 0x40000000).
+    /// Filtered search using two-queue beam search with convergence detection.
     fn search_vector_filtered(
         &self,
         context: &Context,
@@ -186,22 +166,18 @@ impl<T: VectorRepr> DynIndex for DiskANNIndex<GarnetProvider<T>> {
         max_effort: usize,
         output: &mut SearchResults<'_>,
     ) -> ANNResult<SearchStats> {
-        const PAGED_FLAG: usize = 0x40000000; // bit 30
-        const BATCH_MASK: usize = 0x00FF0000; // bits 16-23
-
         let query = bytemuck::cast_slice::<u8, T>(data);
         let k = params.k_value().get();
         let ef = params.l_value().get();
 
         // Extract batch_size from bits 16-23 of max_effort
-        let batch_size = (max_effort & BATCH_MASK) >> 16;
-        let batch_size = if batch_size == 0 { 1 } else { batch_size };
+        let batch_size = 10;
 
-        if max_effort & PAGED_FLAG != 0 {
+        if max_effort == 0 {
             // Paged unlimited mode: use the real EF as beam width.
             // ef may be inflated by C#'s Math.Max(EF, FilterEF|PAGED_FLAG|BATCH_BITS),
             // so strip the flag and batch bits to get a reasonable beam width.
-            let l_value = ef & 0x0000FFFF;
+            let l_value = ef;
 
             let mut state = self.start_paged_search(
                 FullPrecision,
@@ -228,18 +204,18 @@ impl<T: VectorRepr> DynIndex for DiskANNIndex<GarnetProvider<T>> {
             let raw_effort = max_effort & 0x0000FFFF;
             let effort_cap = if raw_effort > 0 { raw_effort } else { 100_000 };
 
-            two_queue_filtered_search(
-                self.inner.provider(),
-                context,
-                query,
-                k,
-                ef,
-                filter_callback,
-                batch_filter_callback,
+        two_queue_filtered_search(
+            self.inner.provider(),
+            context,
+            query,
+            k,
+            ef,
+            filter_callback,
+            batch_filter_callback,
                 batch_size,
-                effort_cap,
-                output,
-            )
+            effort_cap,
+            output,
+        )
         }
     }
 
@@ -467,11 +443,7 @@ fn two_queue_filtered_search<T: VectorRepr>(
     let mut accessor = provider::FullAccessor::new(provider, context, true);
     let computer = accessor.build_query_computer(query)?;
 
-    // Beam convergence: use a fixed beam size for graph traversal quality.
-    // ef from C# = Max(EF, FilterEF) — can be inflated by FilterEF.
-    // The beam should use the base graph EF (typically 200), not FilterEF.
-    // Cap beam at 1000 to prevent FilterEF from inflating it needlessly.
-    let explore_ef = ef.min(1000).max(200);
+    let explore_ef = ef;
 
     // Use a bitvec for visited instead of HashSet — O(1) with better cache locality
     let max_id = provider.max_internal_id() as usize;
@@ -484,7 +456,7 @@ fn two_queue_filtered_search<T: VectorRepr>(
     // Max-heap tracking ef best distances seen (for phase 1 convergence)
     let mut best_seen: BinaryHeap<OrderedF32> = BinaryHeap::with_capacity(explore_ef + 1);
     // Results: max-heap capped at result_cap (worst-first for pruning) — truncated to k at end
-    let result_cap = (k * 5).max(k);
+    let result_cap = explore_ef;
     let mut results: BinaryHeap<(OrderedF32, u32)> = BinaryHeap::with_capacity(result_cap + 1);
 
     let mut cmps: u32 = 0;
