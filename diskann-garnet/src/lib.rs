@@ -108,6 +108,12 @@ struct SearchResults<'a> {
 pub type FilterCandidateCallback =
     unsafe extern "C" fn(context: u64, internal_id: u32) -> u8;
 
+/// Batch per-candidate filter callback: Rust → C#.
+/// Evaluates multiple candidates in one managed/unmanaged transition.
+/// Writes 1 or 0 into `results` for each candidate, returns the number that passed.
+pub type BatchFilterCandidateCallback =
+    Option<unsafe extern "C" fn(context: u64, ids: *const u32, count: u32, results: *mut u8) -> u32>;
+
 impl SearchResults<'_> {
     fn new(ids: *mut u8, ids_len: usize, dists: *mut f32, dists_len: usize) -> Self {
         let ids = unsafe { slice::from_raw_parts_mut(ids, ids_len) };
@@ -697,6 +703,7 @@ pub unsafe extern "C" fn search_vector_filtered(
     output_distances_len: usize,
     _continuation: *mut c_void,
     filter_callback: FilterCandidateCallback,
+    batch_filter_callback: BatchFilterCandidateCallback,
 ) -> i32 {
     let index = unsafe { &*index_ptr.cast::<Index>() };
 
@@ -744,6 +751,7 @@ pub unsafe extern "C" fn search_vector_filtered(
         &params,
         filter,
         filter_callback,
+        batch_filter_callback,
         max_filtering_effort,
         &mut output,
     );
@@ -779,6 +787,7 @@ pub unsafe extern "C" fn search_element_filtered(
     output_distances_len: usize,
     _continuation: *mut c_void,
     filter_callback: FilterCandidateCallback,
+    batch_filter_callback: BatchFilterCandidateCallback,
 ) -> i32 {
     let index = unsafe { &*index_ptr.cast::<Index>() };
     let id_bytes = unsafe { slice::from_raw_parts(id_data, id_len) };
@@ -815,6 +824,7 @@ pub unsafe extern "C" fn search_element_filtered(
         &params,
         filter,
         filter_callback,
+        batch_filter_callback,
         max_filtering_effort,
         &mut output,
     );

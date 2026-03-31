@@ -18,6 +18,7 @@
 //! graph traversal. The only FFI calls happen in the post-filter loop.
 
 use crate::{
+    BatchFilterCandidateCallback,
     FilterCandidateCallback,
     SearchResults,
     garnet::{Context, GarnetId, Term},
@@ -74,6 +75,7 @@ pub trait DynIndex: Send + Sync {
         params: &search::Knn,
         label_filter: Option<(&GarnetQueryLabelProvider, f32)>,
         filter_callback: FilterCandidateCallback,
+        batch_filter_callback: BatchFilterCandidateCallback,
         max_effort: usize,
         output: &mut SearchResults<'_>,
     ) -> ANNResult<SearchStats>;
@@ -85,6 +87,7 @@ pub trait DynIndex: Send + Sync {
         params: &search::Knn,
         label_filter: Option<(&GarnetQueryLabelProvider, f32)>,
         filter_callback: FilterCandidateCallback,
+        batch_filter_callback: BatchFilterCandidateCallback,
         max_effort: usize,
         output: &mut SearchResults<'_>,
     ) -> ANNResult<SearchStats>;
@@ -162,11 +165,16 @@ impl<T: VectorRepr> DynIndex for DiskANNIndex<GarnetProvider<T>> {
         self.search_vector(context, data_bytes, params, filter, output)
     }
 
-    /// Two-queue filtered search: standalone graph walk with convergence detection.
+    /// Filtered search dispatcher.
     ///
-    /// Uses two priority queues (candidates + results) like Redis HNSW.
-    /// Converges when the closest unexplored candidate is farther than the
-    /// k-th best result, or when max_effort is hit.
+    /// Two modes selected via a high-bit flag in max_effort:
+    ///   - Normal (max_effort < PAGED_FLAG): two-queue filtered search with convergence
+    ///   - Paged (max_effort >= PAGED_FLAG): paged unlimited post-filter loop
+    ///
+    /// The paged mode uses DiskANN's native paged search (search_internal + next_search_results)
+    /// which explores the graph in beam-width pages and post-filters each page.
+    ///
+    /// To select paged mode from C#, set FILTER-EF to (desired_effort | 0x40000000).
     fn search_vector_filtered(
         &self,
         context: &Context,
@@ -174,27 +182,65 @@ impl<T: VectorRepr> DynIndex for DiskANNIndex<GarnetProvider<T>> {
         params: &search::Knn,
         _label_filter: Option<(&GarnetQueryLabelProvider, f32)>,
         filter_callback: FilterCandidateCallback,
+        batch_filter_callback: BatchFilterCandidateCallback,
         max_effort: usize,
         output: &mut SearchResults<'_>,
     ) -> ANNResult<SearchStats> {
+        const PAGED_FLAG: usize = 0x40000000; // bit 30
+        const BATCH_MASK: usize = 0x00FF0000; // bits 16-23
+
         let query = bytemuck::cast_slice::<u8, T>(data);
         let k = params.k_value().get();
         let ef = params.l_value().get();
-        // max_effort (FilterEF) controls the recall/latency tradeoff.
-        // Higher FilterEF = more recall at low selectivity but higher latency.
-        // When not set (0), default to 100K for backward compatibility.
-        let effort_cap = if max_effort > 0 { max_effort } else { 100_000 };
 
-        two_queue_filtered_search(
-            self.inner.provider(),
-            context,
-            query,
-            k,
-            ef,
-            filter_callback,
-            effort_cap,
-            output,
-        )
+        // Extract batch_size from bits 16-23 of max_effort
+        let batch_size = (max_effort & BATCH_MASK) >> 16;
+        let batch_size = if batch_size == 0 { 1 } else { batch_size };
+
+        if max_effort & PAGED_FLAG != 0 {
+            // Paged unlimited mode: use the real EF as beam width.
+            // ef may be inflated by C#'s Math.Max(EF, FilterEF|PAGED_FLAG|BATCH_BITS),
+            // so strip the flag and batch bits to get a reasonable beam width.
+            let l_value = ef & 0x0000FFFF;
+
+            let mut state = self.start_paged_search(
+                FullPrecision,
+                context,
+                query,
+                l_value,
+            )?;
+
+            paged_filter_loop_unlimited(
+                self,
+                context,
+                &mut state,
+                k,
+                l_value,
+                filter_callback,
+                batch_filter_callback,
+                batch_size,
+                output,
+                0,
+            )
+        } else {
+            // Two-queue mode (default)
+            // Strip batch_size bits and paged flag from max_effort to get the actual effort cap
+            let raw_effort = max_effort & 0x0000FFFF;
+            let effort_cap = if raw_effort > 0 { raw_effort } else { 100_000 };
+
+            two_queue_filtered_search(
+                self.inner.provider(),
+                context,
+                query,
+                k,
+                ef,
+                filter_callback,
+                batch_filter_callback,
+                batch_size,
+                effort_cap,
+                output,
+            )
+        }
     }
 
     fn search_element_filtered(
@@ -204,6 +250,7 @@ impl<T: VectorRepr> DynIndex for DiskANNIndex<GarnetProvider<T>> {
         params: &search::Knn,
         label_filter: Option<(&GarnetQueryLabelProvider, f32)>,
         filter_callback: FilterCandidateCallback,
+        batch_filter_callback: BatchFilterCandidateCallback,
         max_effort: usize,
         output: &mut SearchResults<'_>,
     ) -> ANNResult<SearchStats> {
@@ -226,6 +273,7 @@ impl<T: VectorRepr> DynIndex for DiskANNIndex<GarnetProvider<T>> {
             params,
             label_filter,
             filter_callback,
+            batch_filter_callback,
             max_effort,
             output,
         )
@@ -269,7 +317,6 @@ impl<T: VectorRepr> DynIndex for DiskANNIndex<GarnetProvider<T>> {
 ///
 /// This allows the search to explore deeply into the graph for low-selectivity
 /// queries, where many candidates need to be evaluated to find matches.
-#[allow(dead_code)]
 fn paged_filter_loop_unlimited<T, S>(
     index: &DiskANNIndex<GarnetProvider<T>>,
     context: &Context,
@@ -277,6 +324,8 @@ fn paged_filter_loop_unlimited<T, S>(
     k: usize,
     l_value: usize,
     filter_callback: FilterCandidateCallback,
+    batch_filter_callback: BatchFilterCandidateCallback,
+    batch_size: usize,
     output: &mut SearchResults<'_>,
     _max_effort: usize,
 ) -> ANNResult<SearchStats>
@@ -307,30 +356,59 @@ where
             break;
         }
 
-        for candidate in &batch[..count] {
-            total_evaluated += 1;
-
+        for candidates_chunk in batch[..count].chunks(batch_size) {
             let cb_start = std::time::Instant::now();
-            let passes = unsafe { filter_callback(context.0, candidate.id) != 0 };
-            filter_ns += cb_start.elapsed().as_nanos() as u64;
 
-            if !passes {
-                continue;
-            }
+            if batch_size > 1 {
+                if let Some(bcb) = batch_filter_callback {
+                    let ids: Vec<u32> = candidates_chunk.iter().map(|c| c.id).collect();
+                    let mut pass_buf = vec![0u8; candidates_chunk.len()];
+                    unsafe { bcb(context.0, ids.as_ptr(), candidates_chunk.len() as u32, pass_buf.as_mut_ptr()); }
+                    filter_ns += cb_start.elapsed().as_nanos() as u64;
 
-            total_passed += 1;
+                    for (i, candidate) in candidates_chunk.iter().enumerate() {
+                        total_evaluated += 1;
+                        if pass_buf[i] == 0 { continue; }
+                        total_passed += 1;
 
-            let eid_start = std::time::Instant::now();
-            let eid_result = index.inner.provider().to_external_id(context, candidate.id);
-            extid_ns += eid_start.elapsed().as_nanos() as u64;
+                        let eid_start = std::time::Instant::now();
+                        let eid_result = index.inner.provider().to_external_id(context, candidate.id);
+                        extid_ns += eid_start.elapsed().as_nanos() as u64;
 
-            if let Ok(eid) = eid_result {
-                if output.push(eid, candidate.distance).is_full() || output.current_len() >= k {
-                    early_exit = true;
-                    break;
+                        if let Ok(eid) = eid_result {
+                            if output.push(eid, candidate.distance).is_full() || output.current_len() >= k {
+                                early_exit = true;
+                                break;
+                            }
+                        }
+                    }
+                    if early_exit { break; }
+                    continue;
                 }
             }
 
+            // Single callback fallback
+            for candidate in candidates_chunk {
+                total_evaluated += 1;
+                let f_start = std::time::Instant::now();
+                let passes = unsafe { filter_callback(context.0, candidate.id) != 0 };
+                filter_ns += f_start.elapsed().as_nanos() as u64;
+
+                if !passes { continue; }
+                total_passed += 1;
+
+                let eid_start = std::time::Instant::now();
+                let eid_result = index.inner.provider().to_external_id(context, candidate.id);
+                extid_ns += eid_start.elapsed().as_nanos() as u64;
+
+                if let Ok(eid) = eid_result {
+                    if output.push(eid, candidate.distance).is_full() || output.current_len() >= k {
+                        early_exit = true;
+                        break;
+                    }
+                }
+            }
+            if early_exit { break; }
         }
 
         if early_exit {
@@ -341,7 +419,7 @@ where
     let total_us = total_start.elapsed().as_micros();
     let stats = SearchStats { cmps: state.scratch.cmps, hops: state.scratch.hops, result_count: output.current_len() as u32, range_search_second_round: false };
     eprintln!(
-        "[paged-unlimited] l={l_value} pages={pages} candidates={total_candidates} evaluated={total_evaluated} passed={total_passed} found={} cmps={} hops={} early_exit={early_exit} total={total_us}µs graph={}µs filter={}µs extid={}µs",
+        "[paged-unlimited] l={l_value} batch_size={batch_size} pages={pages} candidates={total_candidates} evaluated={total_evaluated} passed={total_passed} found={} cmps={} hops={} early_exit={early_exit} total={total_us}µs graph={}µs filter={}µs extid={}µs",
         stats.result_count, stats.cmps, stats.hops, graph_ns / 1000, filter_ns / 1000, extid_ns / 1000
     );
     Ok(stats)
@@ -376,6 +454,8 @@ fn two_queue_filtered_search<T: VectorRepr>(
     k: usize,
     ef: usize,
     filter_callback: FilterCandidateCallback,
+    batch_filter_callback: BatchFilterCandidateCallback,
+    batch_size: usize,
     max_candidates: usize,
     output: &mut SearchResults<'_>,
 ) -> ANNResult<SearchStats> {
@@ -544,17 +624,10 @@ fn two_queue_filtered_search<T: VectorRepr>(
 
             // Filter checks — MUST be outside read_multi_lpiid (no nested FFI)
             let f_start = std::time::Instant::now();
-            for &(nid, dist) in &pending {
-                if results.len() >= result_cap && dist > results.peek().unwrap().0 .0 {
-                    continue;
-                }
-                evaluated += 1;
-                if unsafe { filter_callback(context.0, nid) != 0 } {
-                    passed += 1;
-                    results.push((OrderedF32(dist), nid));
-                    if results.len() > result_cap { results.pop(); }
-                }
-            }
+            filter_candidates_batch(
+                context.0, &pending, filter_callback, batch_filter_callback, batch_size,
+                &mut results, result_cap, &mut evaluated, &mut passed,
+            );
             filter_ns += f_start.elapsed().as_nanos() as u64;
         }
     }
@@ -630,17 +703,10 @@ fn two_queue_filtered_search<T: VectorRepr>(
             }
 
             let f_start = std::time::Instant::now();
-            for &(nid, dist) in &pending {
-                if results.len() >= k && dist > results.peek().unwrap().0 .0 {
-                    continue;
-                }
-                evaluated += 1;
-                if unsafe { filter_callback(context.0, nid) != 0 } {
-                    passed += 1;
-                    results.push((OrderedF32(dist), nid));
-                    if results.len() > result_cap { results.pop(); }
-                }
-            }
+            filter_candidates_batch(
+                context.0, &pending, filter_callback, batch_filter_callback, batch_size,
+                &mut results, result_cap, &mut evaluated, &mut passed,
+            );
             filter_ns += f_start.elapsed().as_nanos() as u64;
         }
     }
@@ -670,12 +736,63 @@ fn two_queue_filtered_search<T: VectorRepr>(
         range_search_second_round: false,
     };
     eprintln!(
-        "[two-queue] ef={ef} k={k} rcap={result_cap} max_effort={max_candidates} hops={hops} cmps={cmps} evaluated={evaluated} \
+        "[two-queue] ef={ef} k={k} rcap={result_cap} max_effort={max_candidates} batch_size={batch_size} hops={hops} cmps={cmps} evaluated={evaluated} \
          passed={passed} found={found} converged={final_converged} ph1_conv={phase1_converged} \
          total={total_us}µs graph={}µs filter={}µs extid={}µs visited={}",
         graph_ns / 1000, filter_ns / 1000, extid_ns / 1000, visited_count
     );
     Ok(stats)
+}
+
+/// Evaluate filter for a batch of candidates.
+/// Uses batch_filter_callback if available and batch_size > 1,
+/// otherwise falls back to single filter_callback.
+#[inline]
+fn filter_candidates_batch(
+    context_id: u64,
+    pending: &[(u32, f32)],
+    filter_callback: FilterCandidateCallback,
+    batch_cb: BatchFilterCandidateCallback,
+    batch_size: usize,
+    results: &mut BinaryHeap<(OrderedF32, u32)>,
+    result_cap: usize,
+    evaluated: &mut u32,
+    passed: &mut u32,
+) {
+    if batch_size > 1 {
+        if let Some(bcb) = batch_cb {
+            for chunk in pending.chunks(batch_size) {
+                let ids: Vec<u32> = chunk.iter().map(|&(nid, _)| nid).collect();
+                let mut pass_buf = vec![0u8; chunk.len()];
+                unsafe { bcb(context_id, ids.as_ptr(), chunk.len() as u32, pass_buf.as_mut_ptr()); }
+                for (i, &(nid, dist)) in chunk.iter().enumerate() {
+                    if results.len() >= result_cap && dist > results.peek().unwrap().0 .0 {
+                        continue;
+                    }
+                    *evaluated += 1;
+                    if pass_buf[i] != 0 {
+                        *passed += 1;
+                        results.push((OrderedF32(dist), nid));
+                        if results.len() > result_cap { results.pop(); }
+                    }
+                }
+            }
+            return;
+        }
+    }
+
+    // Single callback fallback
+    for &(nid, dist) in pending {
+        if results.len() >= result_cap && dist > results.peek().unwrap().0 .0 {
+            continue;
+        }
+        *evaluated += 1;
+        if unsafe { filter_callback(context_id, nid) != 0 } {
+            *passed += 1;
+            results.push((OrderedF32(dist), nid));
+            if results.len() > result_cap { results.pop(); }
+        }
+    }
 }
 
 /// Wrapper for f32 that implements Ord (needed for BinaryHeap).
