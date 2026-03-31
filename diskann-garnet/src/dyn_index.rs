@@ -170,7 +170,8 @@ impl<T: VectorRepr> DynIndex for DiskANNIndex<GarnetProvider<T>> {
         let k = params.k_value().get();
         let ef = params.l_value().get();
 
-        // Extract batch_size from bits 16-23 of max_effort
+        // batch_size: hardcoded to 10 (batch encoding in max_effort bits is unreliable
+        // for effort values > 65535 since bits overlap)
         let batch_size = 10;
 
         if max_effort == 0 {
@@ -200,22 +201,21 @@ impl<T: VectorRepr> DynIndex for DiskANNIndex<GarnetProvider<T>> {
             )
         } else {
             // Two-queue mode (default)
-            // Strip batch_size bits and paged flag from max_effort to get the actual effort cap
-            let raw_effort = max_effort & 0x0000FFFF;
-            let effort_cap = if raw_effort > 0 { raw_effort } else { 100_000 };
 
-        two_queue_filtered_search(
-            self.inner.provider(),
-            context,
-            query,
-            k,
-            ef,
-            filter_callback,
-            batch_filter_callback,
-                batch_size,
-            effort_cap,
-            output,
-        )
+            let effort_cap  = max(ef, max_effort); 
+
+            two_queue_filtered_search(
+                self.inner.provider(),
+                context,
+                query,
+                k,
+                ef,
+                filter_callback,
+                batch_filter_callback,
+                    batch_size,
+                effort_cap,
+                output,
+            )
         }
     }
 
@@ -412,16 +412,7 @@ fn bitvec_test_and_set(bits: &mut [u64], id: u32) -> bool {
     was_set
 }
 
-/// Two-queue filtered search with two-phase convergence.
-///
-/// Phase 1: Standard beam search with convergence detection. Explores the graph
-/// using distance-based convergence (like HNSW). Filter is checked inline.
-/// If k filtered results are found, convergence triggers quickly.
-///
-/// Phase 2 (fallback): If phase 1 converges without k results (low selectivity),
-/// continues expanding from remaining candidates without convergence check,
-/// until k results are found or effort cap is hit.
-///
+/// Two-queue filtered search 
 /// max_candidates controls the total exploration budget (FilterEF from C#).
 fn two_queue_filtered_search<T: VectorRepr>(
     provider: &GarnetProvider<T>,
@@ -453,8 +444,6 @@ fn two_queue_filtered_search<T: VectorRepr>(
 
     // Min-heap for candidates (closest first)
     let mut candidates: BinaryHeap<Reverse<(OrderedF32, u32)>> = BinaryHeap::with_capacity(explore_ef);
-    // Max-heap tracking ef best distances seen (for phase 1 convergence)
-    let mut best_seen: BinaryHeap<OrderedF32> = BinaryHeap::with_capacity(explore_ef + 1);
     // Results: max-heap capped at result_cap (worst-first for pruning) — truncated to k at end
     let result_cap = explore_ef;
     let mut results: BinaryHeap<(OrderedF32, u32)> = BinaryHeap::with_capacity(result_cap + 1);
@@ -463,7 +452,6 @@ fn two_queue_filtered_search<T: VectorRepr>(
     let mut hops: u32 = 0;
     let mut evaluated: u32 = 0;
     let mut passed: u32 = 0;
-    let mut phase1_converged = false;
     let mut final_converged = false;
 
     // Seed with medoid (id=0)
@@ -490,7 +478,6 @@ fn two_queue_filtered_search<T: VectorRepr>(
     };
 
     candidates.push(Reverse((OrderedF32(start_dist), start_id)));
-    best_seen.push(OrderedF32(start_dist));
 
     // Check filter on start node
     evaluated += 1;
@@ -517,24 +504,10 @@ fn two_queue_filtered_search<T: VectorRepr>(
         let Reverse((OrderedF32(cur_dist), current)) = candidates.pop().unwrap();
         hops += 1;
 
-        // Convergence: beam search has settled
-        if best_seen.len() >= explore_ef {
-            let ef_threshold = best_seen.peek().unwrap().0;
-            if cur_dist > ef_threshold {
-                phase1_converged = true;
-                if results.len() >= result_cap {
-                    final_converged = true;
-                    break;
-                }
-                break;
-            }
-        }
-
-        // Result-based convergence
+        // Convergence: ef filtered results found, current is worse than worst
         if results.len() >= result_cap {
             let worst_result = results.peek().unwrap().0 .0;
             if cur_dist > worst_result {
-                phase1_converged = true;
                 final_converged = true;
                 break;
             }
@@ -556,103 +529,12 @@ fn two_queue_filtered_search<T: VectorRepr>(
                         if let Some(cached) = provider.start_point_cache.get(&nid) {
                             let dist = computer.evaluate_similarity(&*cached);
                             cmps += 1;
-                            let beam_threshold = if best_seen.len() >= explore_ef { best_seen.peek().unwrap().0 } else { f32::MAX };
-                            if dist < beam_threshold || best_seen.len() < explore_ef {
-                                candidates.push(Reverse((OrderedF32(dist), nid)));
-                                best_seen.push(OrderedF32(dist));
-                                if best_seen.len() > explore_ef { best_seen.pop(); }
-                            }
+                            candidates.push(Reverse((OrderedF32(dist), nid)));
                             pending.push((nid, dist));
                         }
                     } else {
                         batch_ids.push(4);
                         batch_ids.push(nid);
-                    }
-                }
-            }
-
-            if !batch_ids.is_empty() {
-                let g2_start = std::time::Instant::now();
-                provider.callbacks().read_multi_lpiid(
-                    context.term(Term::Vector),
-                    &batch_ids,
-                    |i, v: &[T]| {
-                        let nid = batch_ids[i as usize * 2 + 1];
-                        let dist = computer.evaluate_similarity(v);
-                        cmps += 1;
-
-                        let beam_threshold = if best_seen.len() >= explore_ef { best_seen.peek().unwrap().0 } else { f32::MAX };
-                        if dist < beam_threshold || best_seen.len() < explore_ef {
-                            candidates.push(Reverse((OrderedF32(dist), nid)));
-                            best_seen.push(OrderedF32(dist));
-                            if best_seen.len() > explore_ef { best_seen.pop(); }
-                        }
-
-                        pending.push((nid, dist));
-                    },
-                );
-                graph_ns += g2_start.elapsed().as_nanos() as u64;
-            }
-
-            // Filter checks — MUST be outside read_multi_lpiid (no nested FFI)
-            let f_start = std::time::Instant::now();
-            filter_candidates_batch(
-                context.0, &pending, filter_callback, batch_filter_callback, batch_size,
-                &mut results, result_cap, &mut evaluated, &mut passed,
-            );
-            filter_ns += f_start.elapsed().as_nanos() as u64;
-        }
-    }
-
-    // ─── Phase 2: Multi-hop batched exploration without beam convergence ───
-    if phase1_converged && !final_converged && results.len() < k {
-        const MULTI_HOP_BATCH: usize = 16;
-        let mut hop_batch: Vec<u32> = Vec::with_capacity(MULTI_HOP_BATCH);
-
-        'phase2: loop {
-            if evaluated as usize >= max_candidates || candidates.is_empty() {
-                break;
-            }
-
-            hop_batch.clear();
-            while hop_batch.len() < MULTI_HOP_BATCH {
-                if candidates.is_empty() { break; }
-                let Reverse((OrderedF32(cur_dist), current)) = candidates.pop().unwrap();
-                hops += 1;
-
-                if results.len() >= k {
-                    let worst_result = results.peek().unwrap().0 .0;
-                    if cur_dist > worst_result {
-                        final_converged = true;
-                        break 'phase2;
-                    }
-                }
-
-                hop_batch.push(current);
-            }
-
-            batch_ids.clear();
-            pending.clear();
-
-            for &current in &hop_batch {
-                let g_start = std::time::Instant::now();
-                accessor.get_neighbors_internal(current, None);
-                graph_ns += g_start.elapsed().as_nanos() as u64;
-
-                for &nid in accessor.id_buffer.iter() {
-                    if !bitvec_test_and_set(&mut visited_bits, nid) {
-                        visited_count += 1;
-                        if nid == 0 {
-                            if let Some(cached) = provider.start_point_cache.get(&nid) {
-                                let dist = computer.evaluate_similarity(&*cached);
-                                cmps += 1;
-                                candidates.push(Reverse((OrderedF32(dist), nid)));
-                                pending.push((nid, dist));
-                            }
-                        } else {
-                            batch_ids.push(4);
-                            batch_ids.push(nid);
-                        }
                     }
                 }
             }
@@ -674,6 +556,7 @@ fn two_queue_filtered_search<T: VectorRepr>(
                 graph_ns += g2_start.elapsed().as_nanos() as u64;
             }
 
+            // Filter checks — MUST be outside read_multi_lpiid (no nested FFI)
             let f_start = std::time::Instant::now();
             filter_candidates_batch(
                 context.0, &pending, filter_callback, batch_filter_callback, batch_size,
@@ -709,7 +592,7 @@ fn two_queue_filtered_search<T: VectorRepr>(
     };
     eprintln!(
         "[two-queue] ef={ef} k={k} rcap={result_cap} max_effort={max_candidates} batch_size={batch_size} hops={hops} cmps={cmps} evaluated={evaluated} \
-         passed={passed} found={found} converged={final_converged} ph1_conv={phase1_converged} \
+         passed={passed} found={found} converged={final_converged} \
          total={total_us}µs graph={}µs filter={}µs extid={}µs visited={}",
         graph_ns / 1000, filter_ns / 1000, extid_ns / 1000, visited_count
     );
