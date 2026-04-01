@@ -442,9 +442,10 @@ fn two_queue_filtered_search<T: VectorRepr>(
     let mut visited_bits = vec![0u64; visited_words];
     let mut visited_count: usize = 0;
 
-    // Min-heap for candidates (closest first)
-    let mut candidates: BinaryHeap<Reverse<(OrderedF32, u32)>> = BinaryHeap::with_capacity(explore_ef);
-    // Results: max-heap capped at result_cap (worst-first for pruning) — truncated to k at end
+    // Min-heap for candidates (closest first) — bounded to ef like Redis
+    let mut candidates: BinaryHeap<Reverse<(OrderedF32, u32)>> = BinaryHeap::with_capacity(explore_ef + 1);
+    // Results: max-heap capped at ef (worst-first for pruning) — truncated to k at end
+    // Matches Redis: results capacity = ef
     let result_cap = explore_ef;
     let mut results: BinaryHeap<(OrderedF32, u32)> = BinaryHeap::with_capacity(result_cap + 1);
 
@@ -492,12 +493,11 @@ fn two_queue_filtered_search<T: VectorRepr>(
     let mut batch_ids: Vec<u32> = Vec::with_capacity(128);
     let mut pending: Vec<(u32, f32)> = Vec::with_capacity(64);
 
-    // ─── Phase 1: Beam-converged exploration with inline filtering ───
+    // ─── Main loop: beam-converged exploration with inline filtering ───
+    // Matches Redis HNSW: effort = nodes popped from candidates (hops), not filter evals.
     while !candidates.is_empty() {
-        // Cap on filter evaluations, not distance comparisons.
-        // Graph exploration (beam convergence) runs freely — only the expensive
-        // FFI filter callback count is bounded by max_candidates (FilterEF).
-        if evaluated as usize >= max_candidates {
+        // Effort cap: stop after max_candidates node expansions (same as Redis)
+        if hops as usize >= max_candidates {
             break;
         }
 
@@ -529,7 +529,11 @@ fn two_queue_filtered_search<T: VectorRepr>(
                         if let Some(cached) = provider.start_point_cache.get(&nid) {
                             let dist = computer.evaluate_similarity(&*cached);
                             cmps += 1;
-                            candidates.push(Reverse((OrderedF32(dist), nid)));
+                            // Redis-style candidate pruning: add if better than furthest or queue not full
+                            let furthest = if results.is_empty() { f32::MAX } else { results.peek().unwrap().0 .0 };
+                            if dist < furthest || candidates.len() < explore_ef {
+                                candidates.push(Reverse((OrderedF32(dist), nid)));
+                            }
                             pending.push((nid, dist));
                         }
                     } else {
@@ -541,6 +545,9 @@ fn two_queue_filtered_search<T: VectorRepr>(
 
             if !batch_ids.is_empty() {
                 let g2_start = std::time::Instant::now();
+                // Capture current furthest distance for candidate pruning inside closure
+                let furthest_for_pruning = if results.is_empty() { f32::MAX } else { results.peek().unwrap().0 .0 };
+                let cand_count = candidates.len();
                 provider.callbacks().read_multi_lpiid(
                     context.term(Term::Vector),
                     &batch_ids,
@@ -549,7 +556,10 @@ fn two_queue_filtered_search<T: VectorRepr>(
                         let dist = computer.evaluate_similarity(v);
                         cmps += 1;
 
-                        candidates.push(Reverse((OrderedF32(dist), nid)));
+                        // Redis-style candidate pruning: add if better than furthest or queue not full
+                        if dist < furthest_for_pruning || (cand_count + pending.len()) < explore_ef {
+                            candidates.push(Reverse((OrderedF32(dist), nid)));
+                        }
                         pending.push((nid, dist));
                     },
                 );
