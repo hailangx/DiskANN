@@ -201,21 +201,43 @@ impl<T: VectorRepr> DynIndex for DiskANNIndex<GarnetProvider<T>> {
             )
         } else {
             // Two-queue mode (default)
+            // Use GARNET_USE_NQP=1 env var to switch to NQP candidate queue
+            static USE_NQP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let use_nqp = *USE_NQP.get_or_init(|| {
+                let val = std::env::var("GARNET_USE_NQP").map(|v| v == "1").unwrap_or(false);
+                eprintln!("[init] GARNET_USE_NQP={val}");
+                val
+            });
 
-            let effort_cap  = max(ef, max_effort); 
+            let effort_cap  = max(ef, max_effort);
 
-            two_queue_filtered_search(
-                self.inner.provider(),
-                context,
-                query,
-                k,
-                ef,
-                filter_callback,
-                batch_filter_callback,
+            if use_nqp {
+                two_queue_native_search(
+                    self.inner.provider(),
+                    context,
+                    query,
+                    k,
+                    ef,
+                    filter_callback,
+                    batch_filter_callback,
                     batch_size,
-                effort_cap,
-                output,
-            )
+                    effort_cap,
+                    output,
+                )
+            } else {
+                two_queue_filtered_search(
+                    self.inner.provider(),
+                    context,
+                    query,
+                    k,
+                    ef,
+                    filter_callback,
+                    batch_filter_callback,
+                    batch_size,
+                    effort_cap,
+                    output,
+                )
+            }
         }
     }
 
@@ -451,10 +473,11 @@ fn two_queue_filtered_search<T: VectorRepr>(
 
     let mut cmps: u32 = 0;
     let mut hops: u32 = 0;
-    let mut evaluated: u32 = 0;
-    let mut passed: u32 = 0;
+    let mut filter_evals: u32 = 0;
+    let mut filter_passed: u32 = 0;
     let mut final_converged = false;
     let mut max_cand_size: usize = 0;
+    let mut max_result_q: usize = 0;
 
     // Seed with medoid (id=0)
     let start_id: u32 = 0;
@@ -482,10 +505,10 @@ fn two_queue_filtered_search<T: VectorRepr>(
     candidates.push(Reverse((OrderedF32(start_dist), start_id)));
 
     // Check filter on start node
-    evaluated += 1;
+    filter_evals += 1;
     let cb_start = std::time::Instant::now();
     if unsafe { filter_callback(context.0, start_id) != 0 } {
-        passed += 1;
+        filter_passed += 1;
         results.push((OrderedF32(start_dist), start_id));
     }
     filter_ns += cb_start.elapsed().as_nanos() as u64;
@@ -574,9 +597,10 @@ fn two_queue_filtered_search<T: VectorRepr>(
             let f_start = std::time::Instant::now();
             filter_candidates_batch(
                 context.0, &pending, filter_callback, batch_filter_callback, batch_size,
-                &mut results, result_cap, &mut evaluated, &mut passed,
+                &mut results, result_cap, &mut filter_evals, &mut filter_passed,
             );
             filter_ns += f_start.elapsed().as_nanos() as u64;
+            if results.len() > max_result_q { max_result_q = results.len(); }
         }
     }
 
@@ -605,10 +629,10 @@ fn two_queue_filtered_search<T: VectorRepr>(
         range_search_second_round: false,
     };
     eprintln!(
-        "[two-queue] ef={ef} k={k} rcap={result_cap} max_effort={max_candidates} batch_size={batch_size} hops={hops} cmps={cmps} evaluated={evaluated} \
-         passed={passed} found={found} converged={final_converged} max_cand_q={max_cand_size} \
-         total={total_us}µs graph={}µs filter={}µs extid={}µs visited={}",
-        graph_ns / 1000, filter_ns / 1000, extid_ns / 1000, visited_count
+        "[search] engine=garnet ef={ef} k={k} max_effort={max_candidates} hops={hops} cmps={cmps} visited={visited_count} \
+         filter_evals={filter_evals} filter_passed={filter_passed} found={found} max_cand_q={max_cand_size} max_result_q={max_result_q} \
+         converged={final_converged} total_us={total_us} graph_us={} filter_us={} extid_us={}",
+        graph_ns / 1000, filter_ns / 1000, extid_ns / 1000
     );
     Ok(stats)
 }
@@ -625,8 +649,8 @@ fn filter_candidates_batch(
     batch_size: usize,
     results: &mut BinaryHeap<(OrderedF32, u32)>,
     result_cap: usize,
-    evaluated: &mut u32,
-    passed: &mut u32,
+    filter_evals: &mut u32,
+    filter_passed: &mut u32,
 ) {
     if batch_size > 1 {
         if let Some(bcb) = batch_cb {
@@ -638,9 +662,9 @@ fn filter_candidates_batch(
                     if results.len() >= result_cap && dist > results.peek().unwrap().0 .0 {
                         continue;
                     }
-                    *evaluated += 1;
+                    *filter_evals += 1;
                     if pass_buf[i] != 0 {
-                        *passed += 1;
+                        *filter_passed += 1;
                         results.push((OrderedF32(dist), nid));
                         if results.len() > result_cap { results.pop(); }
                     }
@@ -655,9 +679,9 @@ fn filter_candidates_batch(
         if results.len() >= result_cap && dist > results.peek().unwrap().0 .0 {
             continue;
         }
-        *evaluated += 1;
+        *filter_evals += 1;
         if unsafe { filter_callback(context_id, nid) != 0 } {
-            *passed += 1;
+            *filter_passed += 1;
             results.push((OrderedF32(dist), nid));
             if results.len() > result_cap { results.pop(); }
         }
@@ -694,11 +718,11 @@ impl Ord for OrderedF32 {
 
 /// Two-queue filtered search using DiskANN's NeighborPriorityQueue.
 ///
-/// Uses NeighborPriorityQueue (SIMD-optimized sorted array with built-in pruning)
-/// as the candidate queue instead of BinaryHeap. The NQP automatically drops
-/// candidates worse than the worst in a full queue — equivalent to Redis-style pruning.
+/// Uses auto-resizable NeighborPriorityQueue (SIMD-optimized sorted array) as the
+/// candidate queue. The queue grows beyond search_param_l when candidates are better
+/// than the worst filtered result, but convergence is bounded by search_param_l.
 ///
-/// Candidates queue: NQP(fixed, capacity=ef) — sorted by distance, auto-prunes.
+/// Candidates queue: NQP(auto_resizable, search_param_l=ef) — grows, converges at ef.
 /// Results queue: BinaryHeap (max-heap, capacity=ef) — filtered matches only.
 /// Visited: bitvec — O(1) bitwise test-and-set.
 fn two_queue_native_search<T: VectorRepr>(
@@ -729,16 +753,18 @@ fn two_queue_native_search<T: VectorRepr>(
     let mut visited_bits = vec![0u64; visited_words];
     let mut visited_count: usize = 0;
 
-    let mut candidates: NeighborPriorityQueue<u32> = NeighborPriorityQueue::new(explore_ef +1);
-    // Results: max-heap capped at ef (worst-first for pruning)
+    let mut candidates: NeighborPriorityQueue<u32> = NeighborPriorityQueue::auto_resizable_with_search_param_l(max_candidates);
+    // Results: max-heap capped at ef (worst-first for pruning) — also guards candidate insertion
     let result_cap = explore_ef;
     let mut results: BinaryHeap<(OrderedF32, u32)> = BinaryHeap::with_capacity(result_cap + 1);
 
     let mut cmps: u32 = 0;
     let mut hops: u32 = 0;
-    let mut evaluated: u32 = 0;
-    let mut passed: u32 = 0;
+    let mut filter_evals: u32 = 0;
+    let mut filter_passed: u32 = 0;
     let mut final_converged = false;
+    let mut max_result_q: usize = 0;
+    let mut max_cand_size: usize = 0;
 
     // Seed with medoid (id=0)
     let start_id: u32 = 0;
@@ -767,10 +793,10 @@ fn two_queue_native_search<T: VectorRepr>(
     candidates.insert(Neighbor::new(start_id, start_dist));
 
     // Check filter on start node
-    evaluated += 1;
+    filter_evals += 1;
     let cb_start = std::time::Instant::now();
     if unsafe { filter_callback(context.0, start_id) != 0 } {
-        passed += 1;
+        filter_passed += 1;
         results.push((OrderedF32(start_dist), start_id));
     }
     filter_ns += cb_start.elapsed().as_nanos() as u64;
@@ -818,8 +844,11 @@ fn two_queue_native_search<T: VectorRepr>(
                         if let Some(cached) = provider.start_point_cache.get(&nid) {
                             let dist = computer.evaluate_similarity(&*cached);
                             cmps += 1;
-                            // NQP insert handles pruning: drops if worse than worst in full queue
-                            candidates.insert(Neighbor::new(nid, dist));
+                            // Guard: only add candidate if better than worst result or results not full
+                            let furthest = if results.is_empty() { f32::MAX } else { results.peek().unwrap().0 .0 };
+                            if dist < furthest || results.len() < result_cap {
+                                candidates.insert(Neighbor::new(nid, dist));
+                            }
                             pending.push((nid, dist));
                         }
                     } else {
@@ -831,6 +860,9 @@ fn two_queue_native_search<T: VectorRepr>(
 
             if !batch_ids.is_empty() {
                 let g2_start = std::time::Instant::now();
+                // Capture current furthest distance for candidate pruning inside closure
+                let furthest_for_pruning = if results.is_empty() { f32::MAX } else { results.peek().unwrap().0 .0 };
+                let result_count = results.len();
                 provider.callbacks().read_multi_lpiid(
                     context.term(Term::Vector),
                     &batch_ids,
@@ -838,8 +870,10 @@ fn two_queue_native_search<T: VectorRepr>(
                         let nid = batch_ids[i as usize * 2 + 1];
                         let dist = computer.evaluate_similarity(v);
                         cmps += 1;
-                        // NQP insert handles pruning automatically
-                        candidates.insert(Neighbor::new(nid, dist));
+                        // Guard: only add candidate if better than worst result or results not full
+                        if dist < furthest_for_pruning || result_count < result_cap {
+                            candidates.insert(Neighbor::new(nid, dist));
+                        }
                         pending.push((nid, dist));
                     },
                 );
@@ -847,12 +881,14 @@ fn two_queue_native_search<T: VectorRepr>(
             }
 
             // Filter checks — MUST be outside read_multi_lpiid (no nested FFI)
+            if candidates.size() > max_cand_size { max_cand_size = candidates.size(); }
             let f_start = std::time::Instant::now();
             filter_candidates_batch(
                 context.0, &pending, filter_callback, batch_filter_callback, batch_size,
-                &mut results, result_cap, &mut evaluated, &mut passed,
+                &mut results, result_cap, &mut filter_evals, &mut filter_passed,
             );
             filter_ns += f_start.elapsed().as_nanos() as u64;
+            if results.len() > max_result_q { max_result_q = results.len(); }
         }
     }
 
@@ -881,10 +917,10 @@ fn two_queue_native_search<T: VectorRepr>(
         range_search_second_round: false,
     };
     eprintln!(
-        "[two-queue-native] ef={ef} k={k} rcap={result_cap} max_effort={max_candidates} batch_size={batch_size} hops={hops} cmps={cmps} evaluated={evaluated} \
-         passed={passed} found={found} converged={final_converged} \
-         total={total_us}µs graph={}µs filter={}µs extid={}µs visited={}",
-        graph_ns / 1000, filter_ns / 1000, extid_ns / 1000, visited_count
+        "[search] engine=garnet-nqp ef={ef} k={k} max_effort={max_candidates} hops={hops} cmps={cmps} visited={visited_count} \
+         filter_evals={filter_evals} filter_passed={filter_passed} found={found} max_cand_q={max_cand_size} max_result_q={max_result_q} \
+         converged={final_converged} total_us={total_us} graph_us={} filter_us={} extid_us={}",
+        graph_ns / 1000, filter_ns / 1000, extid_ns / 1000
     );
     Ok(stats)
 }
