@@ -191,9 +191,13 @@ impl Callbacks {
     #[must_use]
     unsafe fn read_single_raw(&self, ctx: Context, key: &[u8], value: &mut [u8]) -> bool {
         let mut found = false;
+        let value_len = value.len();
         let mut cb = |_, data: &[u8]| {
             found = true;
-            value.copy_from_slice(data);
+            // Copy min(data.len(), value.len()) bytes — storage may contain co-located
+            // attribute data appended after the vector, making stored size > buffer size.
+            let copy_len = data.len().min(value_len);
+            value[..copy_len].copy_from_slice(&data[..copy_len]);
         };
 
         unsafe {
@@ -297,6 +301,19 @@ impl Callbacks {
                 ctx,
                 bytemuck::bytes_of(&key[1]),
                 bytemuck::must_cast_slice::<D, u8>(value),
+            )
+        }
+    }
+
+    #[must_use]
+    pub fn write_iid_raw(&self, ctx: Context, id: u32, value: &[u8]) -> bool {
+        let key = [0, id];
+        // SAFETY: Key bytes are preceded by 4 bytes of extra space.
+        unsafe {
+            self.write_raw(
+                ctx,
+                bytemuck::bytes_of(&key[1]),
+                value,
             )
         }
     }

@@ -114,6 +114,22 @@ pub type FilterCandidateCallback =
 pub type BatchFilterCandidateCallback =
     Option<unsafe extern "C" fn(context: u64, ids: *const u32, count: u32, results: *mut u8) -> u32>;
 
+/// Per-candidate filter callback with co-located attributes: Rust → C#.
+/// Receives attribute bytes directly from co-located storage, eliminating
+/// ExtMap and Attribute reads on the C# side.
+/// Returns 1 if candidate passes, 0 otherwise.
+pub type FilterWithAttrCallback =
+    Option<unsafe extern "C" fn(context: u64, internal_id: u32,
+                                 attr_ptr: *const u8, attr_len: u32) -> u8>;
+
+/// Batch filter callback with co-located attributes: Rust → C#.
+/// Evaluates multiple candidates in one transition, passing attribute data arrays.
+/// Writes 1 or 0 into `results` for each candidate, returns the number that passed.
+pub type BatchFilterWithAttrCallback =
+    Option<unsafe extern "C" fn(context: u64, ids: *const u32,
+                                 attr_ptrs: *const *const u8, attr_lens: *const u32,
+                                 count: u32, results: *mut u8) -> u32>;
+
 impl SearchResults<'_> {
     fn new(ids: *mut u8, ids_len: usize, dists: *mut f32, dists_len: usize) -> Self {
         let ids = unsafe { slice::from_raw_parts_mut(ids, ids_len) };
@@ -313,6 +329,49 @@ impl<'a> From<Poly<[u8], AlignToEight>> for PolyCow<'a> {
     }
 }
 
+/// Build a combined vector+attributes buffer for co-located storage.
+///
+/// Layout: `[vector_bytes | attr_len_u32_as_bytes | padded_attr_bytes]`
+///
+/// - `vector_bytes`: the original vector data (already in the correct format)
+/// - `attr_len`: the attribute byte length, stored as a little-endian u32 in sizeof(T) bytes
+/// - `padded_attr_bytes`: attribute bytes padded to sizeof(T) alignment
+///
+/// The element type size depends on quant_type: NoQuant = 4 (f32), XPreQ8 = 1 (u8).
+fn build_combined_vector(vector_bytes: &[u8], attr_data: &[u8], quant_type: VectorQuantType) -> Option<Vec<u8>> {
+    let elem_size = match quant_type {
+        VectorQuantType::NoQuant => mem::size_of::<f32>(),
+        VectorQuantType::XPreQ8 => mem::size_of::<u8>(),
+        _ => return None,
+    };
+
+    let attr_len = attr_data.len();
+    // Pad attribute bytes to elem_size boundary
+    let padded_attr_len = (attr_len + elem_size - 1) / elem_size * elem_size;
+
+    // Total size: vector + elem_size (for attr_len field) + padded attrs
+    let total_len = vector_bytes.len() + elem_size + padded_attr_len;
+    let mut buf = vec![0u8; total_len];
+
+    // Copy vector
+    buf[..vector_bytes.len()].copy_from_slice(vector_bytes);
+
+    // Write attr_len as u32 in elem_size bytes (little-endian)
+    let offset = vector_bytes.len();
+    let attr_len_u32 = attr_len as u32;
+    let len_bytes = attr_len_u32.to_le_bytes();
+    // Copy min(4, elem_size) bytes of the u32
+    let copy_len = len_bytes.len().min(elem_size);
+    buf[offset..offset + copy_len].copy_from_slice(&len_bytes[..copy_len]);
+
+    // Copy attribute bytes (with zero padding at end)
+    let attr_offset = offset + elem_size;
+    buf[attr_offset..attr_offset + attr_len].copy_from_slice(attr_data);
+    // Remaining padding bytes are already zero from vec![0u8; ...]
+
+    Some(buf)
+}
+
 fn interpret_vector<'a>(
     quant_type: VectorQuantType,
     vector_value_type: VectorValueType,
@@ -428,7 +487,7 @@ pub unsafe extern "C" fn insert(
         return false;
     };
 
-    // Write attributes to garnet
+    // Write attributes to garnet (external store — needed for VGET GETATTR)
     let attr_data = if attribute_len > 0 && !attribute_data.is_null() {
         unsafe { slice::from_raw_parts(attribute_data, attribute_len) }
     } else {
@@ -438,8 +497,37 @@ pub unsafe extern "C" fn insert(
         return false;
     }
 
-    // Insert the vector
-    index.inner.insert(&ctx, &id, &v).is_ok()
+    // Build combined vector + co-located attributes buffer
+    // Layout: [vector_bytes | attr_len_as_T | padded_attr_bytes_as_T]
+    // This lets filtered search read attrs from the same storage read as the vector.
+    let combined = if !attr_data.is_empty() {
+        build_combined_vector(&v, attr_data, index.quant_type)
+    } else {
+        None
+    };
+
+    // Insert the pure vector into DiskANN (graph build uses this for distance computation)
+    if index.inner.insert(&ctx, &id, &v[..]).is_err() {
+        return false;
+    }
+
+    // If we have co-located attributes, overwrite the stored vector with the combined buffer.
+    // The graph build is done, so the combined data won't affect distance computations.
+    // During filtered search, read_multi_lpiid will return the combined data.
+    if let Some(ref combined) = combined {
+        let internal_id = match index.inner.to_internal_id(&ctx, &id) {
+            Some(iid) => iid,
+            None => return true, // insert succeeded but can't find internal ID — shouldn't happen
+        };
+        let combined_as_t: &[u8] = &combined[..];
+        if !index.inner.write_vector_raw(&ctx, internal_id, combined_as_t) {
+            // Combined write failed, but the insert succeeded with the pure vector.
+            // The search will fall back to the old callback path (no co-located attrs).
+            eprintln!("[warn] co-located attr write failed for {:?}", id);
+        }
+    }
+
+    true
 }
 
 fn ensure_index_ready_or_init<F, E>(index: &Index, init: F) -> Option<E>
@@ -704,6 +792,8 @@ pub unsafe extern "C" fn search_vector_filtered(
     _continuation: *mut c_void,
     filter_callback: FilterCandidateCallback,
     batch_filter_callback: BatchFilterCandidateCallback,
+    filter_with_attr_callback: FilterWithAttrCallback,
+    batch_filter_with_attr_callback: BatchFilterWithAttrCallback,
 ) -> i32 {
     let index = unsafe { &*index_ptr.cast::<Index>() };
 
@@ -752,6 +842,8 @@ pub unsafe extern "C" fn search_vector_filtered(
         filter,
         filter_callback,
         batch_filter_callback,
+        filter_with_attr_callback,
+        batch_filter_with_attr_callback,
         max_filtering_effort,
         &mut output,
     );
@@ -788,6 +880,8 @@ pub unsafe extern "C" fn search_element_filtered(
     _continuation: *mut c_void,
     filter_callback: FilterCandidateCallback,
     batch_filter_callback: BatchFilterCandidateCallback,
+    filter_with_attr_callback: FilterWithAttrCallback,
+    batch_filter_with_attr_callback: BatchFilterWithAttrCallback,
 ) -> i32 {
     let index = unsafe { &*index_ptr.cast::<Index>() };
     let id_bytes = unsafe { slice::from_raw_parts(id_data, id_len) };
@@ -825,6 +919,8 @@ pub unsafe extern "C" fn search_element_filtered(
         filter,
         filter_callback,
         batch_filter_callback,
+        filter_with_attr_callback,
+        batch_filter_with_attr_callback,
         max_filtering_effort,
         &mut output,
     );

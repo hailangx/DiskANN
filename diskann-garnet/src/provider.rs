@@ -87,7 +87,7 @@ impl From<GarnetProviderError> for ANNError {
 diskann::always_escalate!(GarnetProviderError);
 
 pub struct GarnetProvider<T: VectorRepr> {
-    dim: usize,
+    pub(crate) dim: usize,
     metric_type: Metric,
     max_degree: usize,
     callbacks: Callbacks,
@@ -517,11 +517,14 @@ impl<T: VectorRepr> ExpandBeam<[T]> for FullAccessor<'_, T> {
                 }
             }
 
+            let dim = self.provider.dim;
             self.provider.callbacks.read_multi_lpiid(
                 self.context.term(Term::Vector),
                 &self.filtered_ids,
-                |i, v| {
-                    let dist = computer.evaluate_similarity(v);
+                |i, v: &[T]| {
+                    // Truncate to dim elements — storage may contain co-located attributes
+                    let vec_data = if v.len() > dim { &v[..dim] } else { v };
+                    let dist = computer.evaluate_similarity(vec_data);
                     on_neighbors(dist, self.filtered_ids[i as usize * 2 + 1]);
                 },
             );
@@ -621,11 +624,14 @@ impl<T: VectorRepr> FillSet for FullAccessor<'_, T> {
         }
 
         if !self.filtered_ids.is_empty() {
+            let dim = self.provider.dim;
             self.provider.callbacks.read_multi_lpiid(
                 self.context.term(Term::Vector),
                 &self.filtered_ids,
-                |id, v| {
-                    set.insert(self.filtered_ids[id as usize * 2 + 1], v.to_vec());
+                |id, v: &[T]| {
+                    // Truncate to dim elements — storage may contain co-located attributes
+                    let vec_data = if v.len() > dim { &v[..dim] } else { v };
+                    set.insert(self.filtered_ids[id as usize * 2 + 1], vec_data.to_vec());
                 },
             );
         }

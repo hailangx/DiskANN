@@ -5,7 +5,9 @@
 
 use crate::{
     BatchFilterCandidateCallback,
+    BatchFilterWithAttrCallback,
     FilterCandidateCallback,
+    FilterWithAttrCallback,
     SearchResults,
     garnet::{Context, GarnetId, Term},
     labels::GarnetQueryLabelProvider,
@@ -62,6 +64,8 @@ pub trait DynIndex: Send + Sync {
         label_filter: Option<(&GarnetQueryLabelProvider, f32)>,
         filter_callback: FilterCandidateCallback,
         batch_filter_callback: BatchFilterCandidateCallback,
+        filter_with_attr_callback: FilterWithAttrCallback,
+        batch_filter_with_attr_callback: BatchFilterWithAttrCallback,
         max_effort: usize,
         output: &mut SearchResults<'_>,
     ) -> ANNResult<SearchStats>;
@@ -74,6 +78,8 @@ pub trait DynIndex: Send + Sync {
         label_filter: Option<(&GarnetQueryLabelProvider, f32)>,
         filter_callback: FilterCandidateCallback,
         batch_filter_callback: BatchFilterCandidateCallback,
+        filter_with_attr_callback: FilterWithAttrCallback,
+        batch_filter_with_attr_callback: BatchFilterWithAttrCallback,
         max_effort: usize,
         output: &mut SearchResults<'_>,
     ) -> ANNResult<SearchStats>;
@@ -87,6 +93,12 @@ pub trait DynIndex: Send + Sync {
     fn internal_id_exists(&self, context: &Context, id: u32) -> bool;
 
     fn external_id_exists(&self, context: &Context, id: &GarnetId) -> bool;
+
+    /// Look up the internal ID for an external ID.
+    fn to_internal_id(&self, context: &Context, id: &GarnetId) -> Option<u32>;
+
+    /// Overwrite the Vector term for an internal ID with raw bytes.
+    fn write_vector_raw(&self, context: &Context, internal_id: u32, data: &[u8]) -> bool;
 }
 
 impl<T: VectorRepr> DynIndex for DiskANNIndex<GarnetProvider<T>> {
@@ -163,6 +175,8 @@ impl<T: VectorRepr> DynIndex for DiskANNIndex<GarnetProvider<T>> {
         _label_filter: Option<(&GarnetQueryLabelProvider, f32)>,
         filter_callback: FilterCandidateCallback,
         batch_filter_callback: BatchFilterCandidateCallback,
+        filter_with_attr_callback: FilterWithAttrCallback,
+        batch_filter_with_attr_callback: BatchFilterWithAttrCallback,
         max_effort: usize,
         output: &mut SearchResults<'_>,
     ) -> ANNResult<SearchStats> {
@@ -220,6 +234,8 @@ impl<T: VectorRepr> DynIndex for DiskANNIndex<GarnetProvider<T>> {
                     ef,
                     filter_callback,
                     batch_filter_callback,
+                    filter_with_attr_callback,
+                    batch_filter_with_attr_callback,
                     batch_size,
                     effort_cap,
                     output,
@@ -233,6 +249,8 @@ impl<T: VectorRepr> DynIndex for DiskANNIndex<GarnetProvider<T>> {
                     ef,
                     filter_callback,
                     batch_filter_callback,
+                    filter_with_attr_callback,
+                    batch_filter_with_attr_callback,
                     batch_size,
                     effort_cap,
                     output,
@@ -249,6 +267,8 @@ impl<T: VectorRepr> DynIndex for DiskANNIndex<GarnetProvider<T>> {
         label_filter: Option<(&GarnetQueryLabelProvider, f32)>,
         filter_callback: FilterCandidateCallback,
         batch_filter_callback: BatchFilterCandidateCallback,
+        filter_with_attr_callback: FilterWithAttrCallback,
+        batch_filter_with_attr_callback: BatchFilterWithAttrCallback,
         max_effort: usize,
         output: &mut SearchResults<'_>,
     ) -> ANNResult<SearchStats> {
@@ -272,6 +292,8 @@ impl<T: VectorRepr> DynIndex for DiskANNIndex<GarnetProvider<T>> {
             label_filter,
             filter_callback,
             batch_filter_callback,
+            filter_with_attr_callback,
+            batch_filter_with_attr_callback,
             max_effort,
             output,
         )
@@ -304,6 +326,18 @@ impl<T: VectorRepr> DynIndex for DiskANNIndex<GarnetProvider<T>> {
 
     fn external_id_exists(&self, context: &Context, id: &GarnetId) -> bool {
         self.inner.provider().vector_id_exists(context, id)
+    }
+
+    fn to_internal_id(&self, context: &Context, id: &GarnetId) -> Option<u32> {
+        self.inner.provider().to_internal_id(context, id).ok()
+    }
+
+    fn write_vector_raw(&self, context: &Context, internal_id: u32, data: &[u8]) -> bool {
+        self.inner.provider().callbacks().write_iid_raw(
+            context.term(Term::Vector),
+            internal_id,
+            data,
+        )
     }
 }
 
@@ -444,6 +478,8 @@ fn two_queue_filtered_search<T: VectorRepr>(
     ef: usize,
     filter_callback: FilterCandidateCallback,
     batch_filter_callback: BatchFilterCandidateCallback,
+    filter_with_attr_callback: FilterWithAttrCallback,
+    batch_filter_with_attr_callback: BatchFilterWithAttrCallback,
     batch_size: usize,
     max_candidates: usize,
     output: &mut SearchResults<'_>,
@@ -504,7 +540,7 @@ fn two_queue_filtered_search<T: VectorRepr>(
 
     candidates.push(Reverse((OrderedF32(start_dist), start_id)));
 
-    // Check filter on start node
+    // Check filter on start node (no co-located attrs for start node — use old callback)
     filter_evals += 1;
     let cb_start = std::time::Instant::now();
     if unsafe { filter_callback(context.0, start_id) != 0 } {
@@ -513,9 +549,15 @@ fn two_queue_filtered_search<T: VectorRepr>(
     }
     filter_ns += cb_start.elapsed().as_nanos() as u64;
 
+    let dim = provider.dim;
+    let has_attr_callbacks = filter_with_attr_callback.is_some() || batch_filter_with_attr_callback.is_some();
+
     // Pre-allocated buffers for neighbor expansion (avoid per-hop allocation)
     let mut batch_ids: Vec<u32> = Vec::with_capacity(128);
-    let mut pending: Vec<(u32, f32)> = Vec::with_capacity(64);
+    // pending_with_attrs: (nid, dist, attr_offset_in_attr_buffer, attr_len)
+    let mut pending_with_attrs: Vec<(u32, f32, usize, usize)> = Vec::with_capacity(64);
+    // Buffer to accumulate attribute bytes extracted from co-located storage
+    let mut attr_buffer: Vec<u8> = if has_attr_callbacks { Vec::with_capacity(4096) } else { Vec::new() };
 
     // ─── Main loop: beam-converged exploration with inline filtering ───
     // Matches Redis HNSW: effort = nodes popped from candidates (hops), not filter evals.
@@ -547,7 +589,8 @@ fn two_queue_filtered_search<T: VectorRepr>(
             graph_ns += g_start.elapsed().as_nanos() as u64;
 
             batch_ids.clear();
-            pending.clear();
+            pending_with_attrs.clear();
+            attr_buffer.clear();
 
             for &nid in accessor.id_buffer.iter() {
                 if !bitvec_test_and_set(&mut visited_bits, nid) {
@@ -561,7 +604,8 @@ fn two_queue_filtered_search<T: VectorRepr>(
                             if dist < furthest || candidates.len() < explore_ef {
                                 candidates.push(Reverse((OrderedF32(dist), nid)));
                             }
-                            pending.push((nid, dist));
+                            // Start node has no co-located attrs
+                            pending_with_attrs.push((nid, dist, 0, 0));
                         }
                     } else {
                         batch_ids.push(4);
@@ -580,14 +624,42 @@ fn two_queue_filtered_search<T: VectorRepr>(
                     &batch_ids,
                     |i, v: &[T]| {
                         let nid = batch_ids[i as usize * 2 + 1];
-                        let dist = computer.evaluate_similarity(v);
+                        // Split: first `dim` elements = vector, rest = co-located attrs
+                        let vec_data = if v.len() > dim { &v[..dim] } else { v };
+                        let dist = computer.evaluate_similarity(vec_data);
                         cmps += 1;
 
                         // Redis-style candidate pruning: add if better than furthest or queue not full
-                        if dist < furthest_for_pruning || (cand_count + pending.len()) < explore_ef {
+                        if dist < furthest_for_pruning || (cand_count + pending_with_attrs.len()) < explore_ef {
                             candidates.push(Reverse((OrderedF32(dist), nid)));
                         }
-                        pending.push((nid, dist));
+
+                        // Extract co-located attribute bytes if present and callbacks use them
+                        if has_attr_callbacks && v.len() > dim {
+                            // Layout after vector: [attr_len_as_T | padded_attr_bytes_as_T]
+                            let extra = &v[dim..];
+                            // Read attr_len from first element (u32 reinterpreted as T)
+                            let attr_len_bytes: &[u8] = bytemuck::cast_slice(&extra[..1]);
+                            let attr_len = u32::from_le_bytes([
+                                attr_len_bytes[0],
+                                if attr_len_bytes.len() > 1 { attr_len_bytes[1] } else { 0 },
+                                if attr_len_bytes.len() > 2 { attr_len_bytes[2] } else { 0 },
+                                if attr_len_bytes.len() > 3 { attr_len_bytes[3] } else { 0 },
+                            ]) as usize;
+
+                            if extra.len() > 1 && attr_len > 0 {
+                                let attr_as_t = &extra[1..];
+                                let attr_bytes: &[u8] = bytemuck::cast_slice(attr_as_t);
+                                let actual_len = attr_len.min(attr_bytes.len());
+                                let offset = attr_buffer.len();
+                                attr_buffer.extend_from_slice(&attr_bytes[..actual_len]);
+                                pending_with_attrs.push((nid, dist, offset, actual_len));
+                            } else {
+                                pending_with_attrs.push((nid, dist, 0, 0));
+                            }
+                        } else {
+                            pending_with_attrs.push((nid, dist, 0, 0));
+                        }
                     },
                 );
                 graph_ns += g2_start.elapsed().as_nanos() as u64;
@@ -595,10 +667,21 @@ fn two_queue_filtered_search<T: VectorRepr>(
 
             // Filter checks — MUST be outside read_multi_lpiid (no nested FFI)
             let f_start = std::time::Instant::now();
-            filter_candidates_batch(
-                context.0, &pending, filter_callback, batch_filter_callback, batch_size,
-                &mut results, result_cap, &mut filter_evals, &mut filter_passed,
-            );
+            if has_attr_callbacks {
+                filter_candidates_batch_with_attrs(
+                    context.0, &pending_with_attrs, &attr_buffer,
+                    filter_callback, batch_filter_callback,
+                    filter_with_attr_callback, batch_filter_with_attr_callback,
+                    batch_size,
+                    &mut results, result_cap, &mut filter_evals, &mut filter_passed,
+                );
+            } else {
+                let plain: Vec<(u32, f32)> = pending_with_attrs.iter().map(|&(nid, dist, _, _)| (nid, dist)).collect();
+                filter_candidates_batch(
+                    context.0, &plain, filter_callback, batch_filter_callback, batch_size,
+                    &mut results, result_cap, &mut filter_evals, &mut filter_passed,
+                );
+            }
             filter_ns += f_start.elapsed().as_nanos() as u64;
             if results.len() > max_result_q { max_result_q = results.len(); }
         }
@@ -688,6 +771,84 @@ fn filter_candidates_batch(
     }
 }
 
+/// Evaluate filter for a batch of candidates using co-located attribute data.
+/// Each candidate has (nid, dist, attr_offset, attr_len) in pending_with_attrs.
+/// Uses the with-attr callbacks if available, otherwise falls back to standard callbacks.
+#[inline]
+fn filter_candidates_batch_with_attrs(
+    context_id: u64,
+    pending_with_attrs: &[(u32, f32, usize, usize)],
+    attr_buffer: &[u8],
+    filter_callback: FilterCandidateCallback,
+    batch_filter_callback: BatchFilterCandidateCallback,
+    filter_with_attr_callback: FilterWithAttrCallback,
+    batch_filter_with_attr_callback: BatchFilterWithAttrCallback,
+    batch_size: usize,
+    results: &mut BinaryHeap<(OrderedF32, u32)>,
+    result_cap: usize,
+    filter_evals: &mut u32,
+    filter_passed: &mut u32,
+) {
+    // Try batch with-attr callback first
+    if batch_size > 1 {
+        if let Some(bcb) = batch_filter_with_attr_callback {
+            for chunk in pending_with_attrs.chunks(batch_size) {
+                let ids: Vec<u32> = chunk.iter().map(|&(nid, _, _, _)| nid).collect();
+                let attr_ptrs: Vec<*const u8> = chunk.iter().map(|&(_, _, off, len)| {
+                    if len > 0 { attr_buffer[off..].as_ptr() } else { std::ptr::null() }
+                }).collect();
+                let attr_lens: Vec<u32> = chunk.iter().map(|&(_, _, _, len)| len as u32).collect();
+                let mut pass_buf = vec![0u8; chunk.len()];
+                unsafe {
+                    bcb(context_id, ids.as_ptr(),
+                        attr_ptrs.as_ptr(), attr_lens.as_ptr(),
+                        chunk.len() as u32, pass_buf.as_mut_ptr());
+                }
+                for (i, &(nid, dist, _, _)) in chunk.iter().enumerate() {
+                    if results.len() >= result_cap && dist > results.peek().unwrap().0 .0 {
+                        continue;
+                    }
+                    *filter_evals += 1;
+                    if pass_buf[i] != 0 {
+                        *filter_passed += 1;
+                        results.push((OrderedF32(dist), nid));
+                        if results.len() > result_cap { results.pop(); }
+                    }
+                }
+            }
+            return;
+        }
+    }
+
+    // Try single with-attr callback
+    if let Some(cb) = filter_with_attr_callback {
+        for &(nid, dist, off, len) in pending_with_attrs {
+            if results.len() >= result_cap && dist > results.peek().unwrap().0 .0 {
+                continue;
+            }
+            *filter_evals += 1;
+            let (attr_ptr, attr_len) = if len > 0 {
+                (attr_buffer[off..].as_ptr(), len as u32)
+            } else {
+                (std::ptr::null(), 0u32)
+            };
+            if unsafe { cb(context_id, nid, attr_ptr, attr_len) != 0 } {
+                *filter_passed += 1;
+                results.push((OrderedF32(dist), nid));
+                if results.len() > result_cap { results.pop(); }
+            }
+        }
+        return;
+    }
+
+    // Fall back to standard callbacks (no attrs — candidates without co-located data)
+    let plain: Vec<(u32, f32)> = pending_with_attrs.iter().map(|&(nid, dist, _, _)| (nid, dist)).collect();
+    filter_candidates_batch(
+        context_id, &plain, filter_callback, batch_filter_callback, batch_size,
+        results, result_cap, filter_evals, filter_passed,
+    );
+}
+
 /// Wrapper for f32 that implements Ord (needed for BinaryHeap).
 /// NaN is treated as greater than everything (pushed to the end).
 #[derive(Clone, Copy, PartialEq)]
@@ -733,6 +894,8 @@ fn two_queue_native_search<T: VectorRepr>(
     ef: usize,
     filter_callback: FilterCandidateCallback,
     batch_filter_callback: BatchFilterCandidateCallback,
+    filter_with_attr_callback: FilterWithAttrCallback,
+    batch_filter_with_attr_callback: BatchFilterWithAttrCallback,
     batch_size: usize,
     max_candidates: usize,
     output: &mut SearchResults<'_>,
@@ -792,7 +955,7 @@ fn two_queue_native_search<T: VectorRepr>(
     // NQP insert: sorted insertion + auto-pruning
     candidates.insert(Neighbor::new(start_id, start_dist));
 
-    // Check filter on start node
+    // Check filter on start node (no co-located attrs for start node — use old callback)
     filter_evals += 1;
     let cb_start = std::time::Instant::now();
     if unsafe { filter_callback(context.0, start_id) != 0 } {
@@ -801,9 +964,13 @@ fn two_queue_native_search<T: VectorRepr>(
     }
     filter_ns += cb_start.elapsed().as_nanos() as u64;
 
+    let dim = provider.dim;
+    let has_attr_callbacks = filter_with_attr_callback.is_some() || batch_filter_with_attr_callback.is_some();
+
     // Pre-allocated buffers for neighbor expansion
     let mut batch_ids: Vec<u32> = Vec::with_capacity(128);
-    let mut pending: Vec<(u32, f32)> = Vec::with_capacity(64);
+    let mut pending_with_attrs: Vec<(u32, f32, usize, usize)> = Vec::with_capacity(64);
+    let mut attr_buffer: Vec<u8> = if has_attr_callbacks { Vec::with_capacity(4096) } else { Vec::new() };
 
     // Main loop: NQP cursor-based iteration
     while candidates.has_notvisited_node() {
@@ -835,7 +1002,8 @@ fn two_queue_native_search<T: VectorRepr>(
             graph_ns += g_start.elapsed().as_nanos() as u64;
 
             batch_ids.clear();
-            pending.clear();
+            pending_with_attrs.clear();
+            attr_buffer.clear();
 
             for &nid in accessor.id_buffer.iter() {
                 if !bitvec_test_and_set(&mut visited_bits, nid) {
@@ -844,12 +1012,11 @@ fn two_queue_native_search<T: VectorRepr>(
                         if let Some(cached) = provider.start_point_cache.get(&nid) {
                             let dist = computer.evaluate_similarity(&*cached);
                             cmps += 1;
-                            // Guard: only add candidate if better than worst result or results not full
                             let furthest = if results.is_empty() { f32::MAX } else { results.peek().unwrap().0 .0 };
                             if dist < furthest || results.len() < result_cap {
                                 candidates.insert(Neighbor::new(nid, dist));
                             }
-                            pending.push((nid, dist));
+                            pending_with_attrs.push((nid, dist, 0, 0));
                         }
                     } else {
                         batch_ids.push(4);
@@ -860,7 +1027,6 @@ fn two_queue_native_search<T: VectorRepr>(
 
             if !batch_ids.is_empty() {
                 let g2_start = std::time::Instant::now();
-                // Capture current furthest distance for candidate pruning inside closure
                 let furthest_for_pruning = if results.is_empty() { f32::MAX } else { results.peek().unwrap().0 .0 };
                 let result_count = results.len();
                 provider.callbacks().read_multi_lpiid(
@@ -868,13 +1034,36 @@ fn two_queue_native_search<T: VectorRepr>(
                     &batch_ids,
                     |i, v: &[T]| {
                         let nid = batch_ids[i as usize * 2 + 1];
-                        let dist = computer.evaluate_similarity(v);
+                        let vec_data = if v.len() > dim { &v[..dim] } else { v };
+                        let dist = computer.evaluate_similarity(vec_data);
                         cmps += 1;
-                        // Guard: only add candidate if better than worst result or results not full
                         if dist < furthest_for_pruning || result_count < result_cap {
                             candidates.insert(Neighbor::new(nid, dist));
                         }
-                        pending.push((nid, dist));
+
+                        if has_attr_callbacks && v.len() > dim {
+                            let extra = &v[dim..];
+                            let attr_len_bytes: &[u8] = bytemuck::cast_slice(&extra[..1]);
+                            let attr_len = u32::from_le_bytes([
+                                attr_len_bytes[0],
+                                if attr_len_bytes.len() > 1 { attr_len_bytes[1] } else { 0 },
+                                if attr_len_bytes.len() > 2 { attr_len_bytes[2] } else { 0 },
+                                if attr_len_bytes.len() > 3 { attr_len_bytes[3] } else { 0 },
+                            ]) as usize;
+
+                            if extra.len() > 1 && attr_len > 0 {
+                                let attr_as_t = &extra[1..];
+                                let attr_bytes: &[u8] = bytemuck::cast_slice(attr_as_t);
+                                let actual_len = attr_len.min(attr_bytes.len());
+                                let offset = attr_buffer.len();
+                                attr_buffer.extend_from_slice(&attr_bytes[..actual_len]);
+                                pending_with_attrs.push((nid, dist, offset, actual_len));
+                            } else {
+                                pending_with_attrs.push((nid, dist, 0, 0));
+                            }
+                        } else {
+                            pending_with_attrs.push((nid, dist, 0, 0));
+                        }
                     },
                 );
                 graph_ns += g2_start.elapsed().as_nanos() as u64;
@@ -883,10 +1072,21 @@ fn two_queue_native_search<T: VectorRepr>(
             // Filter checks — MUST be outside read_multi_lpiid (no nested FFI)
             if candidates.size() > max_cand_size { max_cand_size = candidates.size(); }
             let f_start = std::time::Instant::now();
-            filter_candidates_batch(
-                context.0, &pending, filter_callback, batch_filter_callback, batch_size,
-                &mut results, result_cap, &mut filter_evals, &mut filter_passed,
-            );
+            if has_attr_callbacks {
+                filter_candidates_batch_with_attrs(
+                    context.0, &pending_with_attrs, &attr_buffer,
+                    filter_callback, batch_filter_callback,
+                    filter_with_attr_callback, batch_filter_with_attr_callback,
+                    batch_size,
+                    &mut results, result_cap, &mut filter_evals, &mut filter_passed,
+                );
+            } else {
+                let plain: Vec<(u32, f32)> = pending_with_attrs.iter().map(|&(nid, dist, _, _)| (nid, dist)).collect();
+                filter_candidates_batch(
+                    context.0, &plain, filter_callback, batch_filter_callback, batch_size,
+                    &mut results, result_cap, &mut filter_evals, &mut filter_passed,
+                );
+            }
             filter_ns += f_start.elapsed().as_nanos() as u64;
             if results.len() > max_result_q { max_result_q = results.len(); }
         }
